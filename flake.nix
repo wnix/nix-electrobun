@@ -164,6 +164,300 @@
             chmod +x "$out/electrobun"
           '';
 
+      # ------------------------------------------------------------------ #
+      #  Build Electrobun from source (EXPERIMENTAL — Linux only)          #
+      #                                                                     #
+      #  Compiles the key native components directly against the            #
+      #  Nix-store WebKitGTK, eliminating the need for autoPatchelf or     #
+      #  LD_LIBRARY_PATH hacks.                                             #
+      #                                                                     #
+      #  What is built from source:                                         #
+      #    launcher            — Zig binary (entry-point / signal handler)  #
+      #    libNativeWrapper.so — C++20 bridge to WebKitGTK (GTK-only)       #
+      #    main.js / npmbin.js — TypeScript bundles compiled with bun       #
+      #    electrobun (CLI)    — bun --compile self-contained binary         #
+      #                                                                     #
+      #  What is borrowed from the pre-built core tarball (pure-Zig,       #
+      #  no system lib dependencies — no patching required):               #
+      #    libasar.so, zig-asar, zig-zstd, extractor                       #
+      #    TODO: build these from source once zig-asar is a standalone     #
+      #          Nix derivation                                             #
+      #                                                                     #
+      #  What is replaced from nixpkgs:                                    #
+      #    bun (JS runtime), bsdiff, bspatch                               #
+      #                                                                     #
+      #  Getting started (two hashes need computing before first build):   #
+      #                                                                     #
+      #    Step 1 — pin the source hash:                                   #
+      #      nix build .#packages.x86_64-linux.electrobun-source 2>&1 \   #
+      #        | grep "got:"                                                #
+      #      Paste the hash into mkElectrobunSource below.                 #
+      #                                                                     #
+      #    Step 2 — pin the npm-deps hash:                                 #
+      #      nix build .#packages.x86_64-linux.electrobun-src-npm-deps \  #
+      #        2>&1 | grep "got:"                                           #
+      #      Paste into mkElectrobunSrcNpmDeps below.                      #
+      #                                                                     #
+      #    Step 3 — build:                                                  #
+      #      nix build .#packages.x86_64-linux.electrobun-from-source     #
+      # ------------------------------------------------------------------ #
+
+      # Fixed-output derivation: fetch the upstream source tree.
+      # The only submodule (package/src/bsdiff/zstd) is replaced by nixpkgs
+      # bsdiff, so fetchSubmodules = false (the default) is fine.
+      mkElectrobunSource = pkgs:
+        pkgs.fetchFromGitHub {
+          owner = "blackboardsh";
+          repo  = "electrobun";
+          rev   = "v${electrobunVersion}";
+          # Compute with:
+          #   nix build .#packages.x86_64-linux.electrobun-source 2>&1 | grep "got:"
+          hash  = nixpkgs.lib.fakeHash;
+        };
+
+      # Fixed-output derivation: npm dependencies of the electrobun package.
+      # Required to build the TypeScript CLI and JS bundle (main.js).
+      # Compute after pinning mkElectrobunSource.hash:
+      #   nix build .#packages.x86_64-linux.electrobun-src-npm-deps 2>&1 | grep "got:"
+      mkElectrobunSrcNpmDeps = pkgs: electrobunSrc:
+        pkgs.stdenv.mkDerivation {
+          pname   = "electrobun-src-npm-deps";
+          version = electrobunVersion;
+          src     = electrobunSrc;
+
+          nativeBuildInputs = [ pkgs.bun ];
+
+          impureEnvVars = pkgs.lib.fetchers.proxyImpureEnvVars
+            ++ [ "GIT_PROXY_COMMAND" "SOCKS_SERVER" ];
+
+          buildPhase = ''
+            runHook preBuild
+            export HOME="$TMPDIR"
+            pushd package
+            bun install --no-progress --frozen-lockfile
+            popd
+            runHook postBuild
+          '';
+
+          installPhase = ''
+            runHook preInstall
+            mkdir -p "$out"
+            cp -r package/node_modules "$out/"
+            runHook postInstall
+          '';
+
+          outputHashAlgo = "sha256";
+          outputHashMode = "recursive";
+          # Compute with:
+          #   nix build .#packages.x86_64-linux.electrobun-src-npm-deps 2>&1 | grep "got:"
+          outputHash = nixpkgs.lib.fakeHash;
+        };
+
+      mkElectrobunFromSource = pkgs:
+        let
+          plat = systemToPlatform.${pkgs.stdenv.hostPlatform.system};
+
+          # Zig cross-target string for the launcher binary.
+          zigTarget = {
+            "x86_64-linux"  = "x86_64-linux-gnu";
+            "aarch64-linux" = "aarch64-linux-gnu";
+          }.${pkgs.stdenv.hostPlatform.system} or
+            (throw "electrobun-from-source: unsupported system ${pkgs.stdenv.hostPlatform.system}");
+
+          # Pre-built core is used only for the pure-Zig tools (libasar.so,
+          # zig-asar, zig-zstd, extractor) that have no GTK/WebKit deps.
+          electrobunCore    = mkElectrobunCore pkgs;
+          electrobunSrc     = mkElectrobunSource pkgs;
+          electrobunNpmDeps = mkElectrobunSrcNpmDeps pkgs electrobunSrc;
+        in
+
+        if !pkgs.stdenv.isLinux then
+          throw "electrobun-from-source: Linux only (Darwin build requires Objective-C++ / Cocoa — not yet implemented)"
+        else
+
+        pkgs.stdenv.mkDerivation {
+          pname   = "electrobun-from-source";
+          version = electrobunVersion;
+          src     = electrobunSrc;
+
+          nativeBuildInputs = with pkgs; [
+            zig_0_13    # builds the launcher binary
+            bun         # bundles TypeScript → JS and compiles the CLI
+            pkg-config  # provides WebKitGTK / GTK3 compile+link flags
+          ];
+
+          # These become -I and -L search paths for the g++ invocation below.
+          buildInputs = linuxRuntimeLibs pkgs;
+
+          buildPhase = ''
+            runHook preBuild
+
+            export HOME="$TMPDIR"
+            export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
+
+            # All electrobun source lives under package/ in the repo root.
+            # pushd/popd keeps the working directory clean for installPhase.
+            pushd package
+
+            # -------------------------------------------------------------- #
+            # 1. launcher — pure Zig, links only libc                         #
+            #    The launcher is the OS-level entry point that starts bun,    #
+            #    forwards signals, and waits for the child process to exit.   #
+            # -------------------------------------------------------------- #
+            (
+              cd src/launcher
+              zig build \
+                -Doptimize=ReleaseSafe \
+                -Dtarget=${zigTarget} \
+                --prefix "$TMPDIR/launcher-out"
+            )
+
+            # -------------------------------------------------------------- #
+            # 2. libNativeWrapper.so — C++20, WebKitGTK + GTK3 (GTK-only)    #
+            #                                                                  #
+            #    This shared library is the native bridge between the Bun JS  #
+            #    runtime and the system windowing / rendering layer.           #
+            #                                                                  #
+            #    IMPORTANT: because we compile against the Nix-store           #
+            #    WebKitGTK, the linker automatically embeds correct RPATHs    #
+            #    pointing into /nix/store.  No autoPatchelf or               #
+            #    LD_LIBRARY_PATH hacks are needed at runtime!                 #
+            #                                                                  #
+            #    Also links libasar.so (pure-Zig ASAR library borrowed from  #
+            #    the pre-built core tarball; it has no GTK deps so the RPATH  #
+            #    $ORIGIN trick is sufficient).                                 #
+            #                                                                  #
+            #    NOTE: if the build fails with missing CEF SDK headers, add   #
+            #    a cefHeaders FOD (the CEF include/ dir from Spotify's CDN)   #
+            #    and pass -I''${cefHeaders} to the g++ compile step.          #
+            # -------------------------------------------------------------- #
+            mkdir -p src/native/linux/build src/native/build
+
+            LIBASAR="${electrobunCore}/libasar.so"
+            PKG_CFLAGS="$(pkg-config --cflags webkit2gtk-4.1 gtk+-3.0)"
+            PKG_LIBS="$(pkg-config --libs   webkit2gtk-4.1 gtk+-3.0)"
+
+            # Compile the C++20 translation unit.
+            # -Isrc/native/linux  exposes the local cef_loader.h header which
+            #   guards conditional CEF code paths in nativeWrapper.cpp.
+            # -DNO_APPINDICATOR   disables optional libappindicator tray support.
+            g++ -c -std=c++20 -fPIC \
+              $PKG_CFLAGS \
+              -Isrc/native/linux \
+              -DNO_APPINDICATOR \
+              -o src/native/linux/build/nativeWrapper.o \
+              src/native/linux/nativeWrapper.cpp
+
+            # Link the GTK-only shared library.
+            # -Wl,-rpath,'$ORIGIN'  instructs the runtime linker to search the
+            #   directory containing libNativeWrapper.so itself for libasar.so.
+            #   Both files are installed to dist-<plat>/ so this resolves.
+            g++ -shared \
+              -Wl,-rpath,'$ORIGIN' \
+              -o src/native/build/libNativeWrapper.so \
+              src/native/linux/build/nativeWrapper.o \
+              "$LIBASAR" \
+              $PKG_LIBS \
+              -ldl -lpthread
+
+            # -------------------------------------------------------------- #
+            # 3. TypeScript bundles and standalone CLI via bun                #
+            # -------------------------------------------------------------- #
+
+            # Wire in the pre-fetched node_modules (no network needed here).
+            cp -r "${electrobunNpmDeps}/node_modules" ./node_modules
+
+            # Framework main-process bundle — loaded by bun at app start.
+            bun build \
+              ./src/bun/index.ts \
+              --target=bun \
+              --outfile="$TMPDIR/main.js"
+
+            # npm-bin shim — the thin wrapper invoked as `electrobun` via npm.
+            bun build \
+              ./src/npmbin/index.ts \
+              --target=bun \
+              --outfile="$TMPDIR/npmbin.js"
+
+            # Standalone CLI binary.  `bun build --compile` embeds a bun
+            # runtime inside the CLI executable itself (separate from the
+            # app's runtime bun binary in dist-<plat>/bun).
+            bun build --compile \
+              ./src/cli/index.ts \
+              --outfile="$TMPDIR/electrobun-cli"
+
+            popd
+            runHook postBuild
+          '';
+
+          installPhase = ''
+            runHook preInstall
+
+            DIST="$out/dist-${plat}"
+            mkdir -p "$DIST" "$out/bin"
+
+            # ---- Built from source ----------------------------------------
+            install -m 755 "$TMPDIR/launcher-out/bin/launcher"           "$DIST/launcher"
+            install -m 755 package/src/native/build/libNativeWrapper.so   "$DIST/libNativeWrapper.so"
+            cp             "$TMPDIR/main.js"                              "$DIST/main.js"
+            cp             "$TMPDIR/npmbin.js"                            "$DIST/npmbin.js"
+            install -m 755 "$TMPDIR/electrobun-cli"                      "$out/bin/electrobun"
+
+            # ---- Pure-Zig tools — reused from pre-built core tarball ------
+            # These binaries (libasar.so, zig-asar, zig-zstd, extractor) are
+            # statically linked or link only libc; they have no WebKit/GTK
+            # dependencies and require no patching on NixOS.
+            # TODO: build from source once zig-asar is a standalone input.
+            cp             "${electrobunCore}/libasar.so"  "$DIST/libasar.so"
+            install -m 755 "${electrobunCore}/zig-asar"    "$DIST/zig-asar"
+            install -m 755 "${electrobunCore}/zig-zstd"    "$DIST/zig-zstd"
+            install -m 755 "${electrobunCore}/extractor"   "$DIST/extractor"
+
+            # ---- Replaced from nixpkgs ------------------------------------
+            # bun: JS runtime that executes main.js and the user's app code.
+            cp             "${pkgs.bun}/bin/bun"           "$DIST/bun"
+            # bsdiff / bspatch: nixpkgs provides a C implementation compatible
+            # with the zig-bsdiff variant used in the upstream pre-built release.
+            install -m 755 "${pkgs.bsdiff}/bin/bsdiff"     "$DIST/bsdiff"
+            install -m 755 "${pkgs.bsdiff}/bin/bspatch"    "$DIST/bspatch"
+
+            # process_helper is the CEF subprocess helper; not needed for the
+            # GTK-only (bundleCEF = false) build target — intentionally omitted.
+
+            runHook postInstall
+          '';
+
+          meta = with nixpkgs.lib; {
+            description = "Electrobun desktop framework native components built from source";
+            longDescription = ''
+              Builds the core Electrobun native components from the upstream
+              v${electrobunVersion} source rather than using pre-built binary blobs:
+
+                launcher            — Zig binary (entry-point / process manager)
+                libNativeWrapper.so — C++20, compiled against Nix-store WebKitGTK
+                main.js / npmbin.js — bun TypeScript bundles
+                electrobun (CLI)    — bun compiled self-contained binary
+
+              Because libNativeWrapper.so is compiled against the Nix-store
+              WebKitGTK the linker embeds the correct RPATH automatically —
+              no autoPatchelfHook or LD_LIBRARY_PATH hacks needed.
+
+              The remaining distribution items (libasar.so, zig-asar, zig-zstd,
+              extractor) are pure-Zig binaries with no system library dependencies
+              and are reused from the upstream pre-built tarball until zig-asar
+              is exposed as a standalone Nix derivation.  bun and bsdiff/bspatch
+              come from nixpkgs.
+
+              Status: EXPERIMENTAL — Linux only.
+              Two FOD hashes must be computed before first build; see comments
+              on mkElectrobunSource and mkElectrobunSrcNpmDeps.
+            '';
+            homepage  = "https://github.com/blackboardsh/electrobun";
+            license   = licenses.mit;
+            platforms = platforms.linux;
+          };
+        };
+
     in
     {
       # ------------------------------------------------------------------ #
@@ -372,11 +666,20 @@
               '';
             };
 
+          # ---- Experimental: build Electrobun native components from source ----
+          # These three bindings expose the from-source build pipeline so
+          # hashes can be computed step by step (see comments on
+          # mkElectrobunSource and mkElectrobunSrcNpmDeps above).
+          electrobun-source       = mkElectrobunSource pkgs;
+          electrobun-src-npm-deps = mkElectrobunSrcNpmDeps pkgs (mkElectrobunSource pkgs);
+          electrobun-from-source  = mkElectrobunFromSource pkgs;
+
         in
         {
           default = electrobun-hello;
           node-modules = node-modules;
           electrobun-core = mkElectrobunCore pkgs;
+          inherit electrobun-source electrobun-src-npm-deps electrobun-from-source;
         }
       );
 
