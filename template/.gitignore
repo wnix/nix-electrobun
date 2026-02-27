@@ -1,0 +1,8 @@
+node_modules/
+dist/
+build/
+.electrobun/
+out/
+*.app/
+*.AppImage
+*.exe

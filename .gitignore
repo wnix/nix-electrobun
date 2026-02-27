@@ -1,0 +1,7 @@
+result
+result-*
+.direnv/
+template/node_modules/
+template/dist/
+template/build/
+template/.electrobun/

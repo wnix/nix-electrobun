@@ -1,0 +1,16 @@
+{
+	"name": "my-electrobun-app",
+	"version": "0.1.0",
+	"description": "An Electrobun desktop application",
+	"scripts": {
+		"start": "electrobun dev",
+		"dev": "electrobun dev --watch",
+		"build": "electrobun build --env=stable"
+	},
+	"dependencies": {
+		"electrobun": "latest"
+	},
+	"devDependencies": {
+		"@types/bun": "latest"
+	}
+}
