@@ -210,9 +210,7 @@
           owner = "blackboardsh";
           repo  = "electrobun";
           rev   = "v${electrobunVersion}";
-          # Compute with:
-          #   nix build .#packages.x86_64-linux.electrobun-source 2>&1 | grep "got:"
-          hash  = nixpkgs.lib.fakeHash;
+          hash  = "sha256-5V/1PaVS4VW/WL36QRZk92Lt6omzEW7KaQRQdzV6ohc=";
         };
 
       # Fixed-output derivation: npm dependencies of the electrobun package.
@@ -248,9 +246,7 @@
 
           outputHashAlgo = "sha256";
           outputHashMode = "recursive";
-          # Compute with:
-          #   nix build .#packages.x86_64-linux.electrobun-src-npm-deps 2>&1 | grep "got:"
-          outputHash = nixpkgs.lib.fakeHash;
+          outputHash = "sha256-ig4C2W784VJi6NVo8Cwlnn7Cxm3ShBuU82cV74TUUIQ=";
         };
 
       mkElectrobunFromSource = pkgs:
@@ -269,6 +265,95 @@
           electrobunCore    = mkElectrobunCore pkgs;
           electrobunSrc     = mkElectrobunSource pkgs;
           electrobunNpmDeps = mkElectrobunSrcNpmDeps pkgs electrobunSrc;
+
+          # CEF SDK headers — nativeWrapper.cpp includes CEF headers
+          # (via src/shared/chromium_flags.h) even in the GTK-only build.
+          # We need the include/ directory from the CEF minimal tarball.
+          # Only the headers are extracted; the CEF binaries are NOT linked.
+          cefVersion = "145.0.23+g3e7fe1c+chromium-145.0.7632.68";
+          cefHeaders = pkgs.runCommand "cef-headers-${cefVersion}" {
+            src = pkgs.fetchurl {
+              url = "https://cef-builds.spotifycdn.com/cef_binary_${cefVersion}_linux64_minimal.tar.bz2";
+              hash = "sha256-YthgLVIcc3UeqHR010mZjNsB/t27bx0paDDhqYpxSsA=";
+            };
+          } ''
+            mkdir -p "$out"
+            # Extract only the include/ directory from the CEF tarball.
+            # The top-level dir is cef_binary_<version>_linux64_minimal/;
+            # --strip-components=1 removes that prefix so we get include/ directly.
+            # We name the member explicitly to avoid --wildcards portability issues.
+            tar xjf "$src" \
+              --strip-components=1 \
+              -C "$out" \
+              "cef_binary_${cefVersion}_linux64_minimal/include"
+          '';
+
+          # Script to generate src/bun/preload/.generated/compiled.ts.
+          # Mirrors the generatePreloadScript() function in build.ts.
+          # Uses string concatenation (no JS template literals) to avoid
+          # Nix interpolation conflicts with ${...} syntax.
+          preloadGenScript = pkgs.writeText "gen-electrobun-preload.ts" ''
+            import { build } from "bun";
+            import { mkdirSync, writeFileSync } from "fs";
+            import { join } from "path";
+
+            const preloadDir = join(process.cwd(), "src", "bun", "preload");
+            const outputDir  = join(preloadDir, ".generated");
+            mkdirSync(outputDir, { recursive: true });
+
+            const [fullResult, sandboxedResult] = await Promise.all([
+              build({ entrypoints: [join(preloadDir, "index.ts")],
+                      target: "browser", format: "iife", minify: false }),
+              build({ entrypoints: [join(preloadDir, "index-sandboxed.ts")],
+                      target: "browser", format: "iife", minify: false }),
+            ]);
+
+            if (!fullResult.success) {
+              console.error(fullResult.logs);
+              throw new Error("Full preload build failed");
+            }
+            if (!sandboxedResult.success) {
+              console.error(sandboxedResult.logs);
+              throw new Error("Sandboxed preload build failed");
+            }
+
+            const fullJs      = await fullResult.outputs[0].text();
+            const sandboxedJs = await sandboxedResult.outputs[0].text();
+
+            const outputContent =
+              "// Auto-generated file. Do not edit directly.\n" +
+              "// Run \"bun build.ts\" from the package folder to regenerate.\n\n" +
+              "export const preloadScript = " + JSON.stringify(fullJs) + ";\n\n" +
+              "export const preloadScriptSandboxed = " + JSON.stringify(sandboxedJs) + ";\n";
+
+            writeFileSync(join(outputDir, "compiled.ts"), outputContent);
+            console.log("[gen-preload] Done.");
+          '';
+
+          # Stub for src/cli/templates/embedded.ts.
+          # build.ts generates this from a templates/ directory; since the
+          # electrobun source repo does not ship a templates/ dir, we provide
+          # the same empty-object skeleton that build.ts would write when it
+          # finds no templates.
+          embeddedTemplatesStub = pkgs.writeText "electrobun-embedded-templates.ts" ''
+            // Auto-generated file. Do not edit directly.
+            // Generated from templates/ directory
+
+            export interface Template {
+              name: string;
+              files: Record<string, string>;
+            }
+
+            export const templates: Record<string, Template> = {};
+
+            export function getTemplateNames(): string[] {
+              return Object.keys(templates);
+            }
+
+            export function getTemplate(name: string): Template | undefined {
+              return templates[name];
+            }
+          '';
         in
 
         if !pkgs.stdenv.isLinux then
@@ -338,12 +423,15 @@
             PKG_LIBS="$(pkg-config --libs   webkit2gtk-4.1 gtk+-3.0)"
 
             # Compile the C++20 translation unit.
-            # -Isrc/native/linux  exposes the local cef_loader.h header which
-            #   guards conditional CEF code paths in nativeWrapper.cpp.
+            # -Isrc/native/linux  exposes local headers (cef_loader.h, etc.)
+            # -I${cefHeaders}     provides CEF SDK headers; nativeWrapper.cpp
+            #   includes them via src/shared/chromium_flags.h even in the
+            #   GTK-only build (the CEF runtime is NOT linked).
             # -DNO_APPINDICATOR   disables optional libappindicator tray support.
             g++ -c -std=c++20 -fPIC \
               $PKG_CFLAGS \
               -Isrc/native/linux \
+              -I${cefHeaders} \
               -DNO_APPINDICATOR \
               -o src/native/linux/build/nativeWrapper.o \
               src/native/linux/nativeWrapper.cpp
@@ -367,6 +455,25 @@
             # Wire in the pre-fetched node_modules (no network needed here).
             cp -r "${electrobunNpmDeps}/node_modules" ./node_modules
 
+            # -------------------------------------------------------------- #
+            # 3a. Generate preload scripts                                     #
+            #     src/bun/preload/.generated/compiled.ts                       #
+            #     native.ts imports this file; it embeds the pre-compiled      #
+            #     webview injection scripts as exported string constants.      #
+            # -------------------------------------------------------------- #
+            bun "${preloadGenScript}"
+
+            # -------------------------------------------------------------- #
+            # 3b. Stub out the CLI template embeddings                         #
+            #     src/cli/templates/embedded.ts                                #
+            #     build.ts normally generates this from a templates/ dir that #
+            #     is not included in the upstream source tarball.  We supply  #
+            #     the identical empty-templates skeleton that build.ts writes  #
+            #     when it finds no templates directory.                        #
+            # -------------------------------------------------------------- #
+            mkdir -p src/cli/templates
+            cp "${embeddedTemplatesStub}" src/cli/templates/embedded.ts
+
             # Framework main-process bundle — loaded by bun at app start.
             bun build \
               ./src/bun/index.ts \
@@ -374,8 +481,9 @@
               --outfile="$TMPDIR/main.js"
 
             # npm-bin shim — the thin wrapper invoked as `electrobun` via npm.
+            # Note: this entry point is plain JS (not TypeScript).
             bun build \
-              ./src/npmbin/index.ts \
+              ./src/npmbin/index.js \
               --target=bun \
               --outfile="$TMPDIR/npmbin.js"
 
